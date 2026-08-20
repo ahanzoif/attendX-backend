@@ -6,14 +6,14 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const QRCode = require('qrcode');
 
 const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-        origin: '*'
+        origin: '*',
+        methods: ['GET', 'POST']
     }
 });
 
@@ -49,6 +49,11 @@ function generateToken() {
 }
 
 function rotateToken() {
+    // Never rotate/emit a QR token when there is no active class.
+    if (!currentSessionId) {
+        return;
+    }
+
     const now = Date.now();
 
     currentToken = {
@@ -59,11 +64,13 @@ function rotateToken() {
     };
 
     io.emit('new-token', {
-        token: currentToken.value
+        token: currentToken.value,
+        sessionId: currentSessionId,
+        expiresAt: currentToken.expiresAt
     });
 
     console.log(
-        `[${new Date(now).toISOString()}] New QR token: ${currentToken.value}`
+        `[${new Date(now).toISOString()}] New QR token for session ${currentSessionId}: ${currentToken.value}`
     );
 }
 
@@ -196,7 +203,15 @@ app.post('/api/session/start', async (req, res) => {
         };
 
         io.emit('new-token', {
-            token: currentToken.value
+            token: currentToken.value,
+            sessionId: currentSessionId,
+            expiresAt: currentToken.expiresAt
+        });
+
+        io.emit('session-started', {
+            sessionId: currentSessionId,
+            subject,
+            classId
         });
 
         console.log(
@@ -209,7 +224,9 @@ app.post('/api/session/start', async (req, res) => {
 
         return res.json({
             success: true,
-            sessionId: currentSessionId
+            sessionId: currentSessionId,
+            token: currentToken.value,
+            expiresAt: currentToken.expiresAt
         });
 
     } catch (error) {
@@ -246,6 +263,10 @@ app.post('/api/session/end', async (req, res) => {
         }
 
         if (currentSessionId === sessionId) {
+            io.emit('session-ended', {
+                sessionId
+            });
+
             currentSessionId = null;
 
             currentToken = {
@@ -283,6 +304,13 @@ app.post('/api/scan', async (req, res) => {
             scan_timestamp
         } = req.body;
 
+        if (!student_id || !device_id || !qr_data) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing scan data.'
+            });
+        }
+
         // CHECK 1 - Active session exists
         if (!currentSessionId) {
             return res.json({
@@ -307,7 +335,11 @@ app.post('/api/scan', async (req, res) => {
 
         const token = qrPayload?.token;
 
-        if (!token || token !== currentToken.value) {
+        if (
+            !token ||
+            token !== currentToken.value ||
+            currentToken.sessionId !== currentSessionId
+        ) {
             return res.json({
                 success: false,
                 message: 'QR expired. Scan again.'
@@ -323,10 +355,17 @@ app.post('/api/scan', async (req, res) => {
         }
 
         // CHECK 4 - Location validation
+        const classroomLat = Number(process.env.CLASSROOM_LAT);
+        const classroomLng = Number(process.env.CLASSROOM_LNG);
+        const classroomRadius = Number(process.env.CLASSROOM_RADIUS);
+
+        const studentLat = Number(lat);
+        const studentLng = Number(lng);
+
         if (
-            lat === null ||
-            lat === undefined ||
-            Number(lat) === 0
+            !Number.isFinite(studentLat) ||
+            !Number.isFinite(studentLng) ||
+            (studentLat === 0 && studentLng === 0)
         ) {
             return res.json({
                 success: false,
@@ -334,12 +373,18 @@ app.post('/api/scan', async (req, res) => {
             });
         }
 
-        const classroomLat = parseFloat(process.env.CLASSROOM_LAT);
-        const classroomLng = parseFloat(process.env.CLASSROOM_LNG);
-        const classroomRadius = parseFloat(process.env.CLASSROOM_RADIUS);
-
-        const studentLat = parseFloat(lat);
-        const studentLng = parseFloat(lng);
+        if (
+            !Number.isFinite(classroomLat) ||
+            !Number.isFinite(classroomLng) ||
+            !Number.isFinite(classroomRadius) ||
+            classroomRadius <= 0
+        ) {
+            console.error('Invalid classroom location configuration.');
+            return res.status(500).json({
+                success: false,
+                message: 'Classroom location is not configured on the server.'
+            });
+        }
 
         const distance = haversineDistance(
             studentLat,
@@ -403,14 +448,20 @@ app.post('/api/scan', async (req, res) => {
         }
 
         if (sameDeviceRecords && sameDeviceRecords.length > 0) {
-            await supabase
+            const threatReason = 'Multiple students same device';
+
+            const { error: threatInsertError } = await supabase
                 .from('threats')
                 .insert({
                     session_id: currentSessionId,
                     student_id,
                     device_id,
-                    reason: 'Multiple students same device'
+                    reason: threatReason
                 });
+
+            if (threatInsertError) {
+                console.error('Threat insert error:', threatInsertError);
+            }
 
             const {
                 data: scoreData,
@@ -445,12 +496,42 @@ app.post('/api/scan', async (req, res) => {
                         updateScoreError
                     );
                 }
+            } else {
+                const { error: insertScoreError } = await supabase
+                    .from('scores')
+                    .insert({
+                        student_id,
+                        score: 90,
+                        last_updated: new Date().toISOString()
+                    });
+
+                if (insertScoreError) {
+                    console.error(
+                        'Threat score insert error:',
+                        insertScoreError
+                    );
+                }
+            }
+
+            const {
+                data: threatStudent,
+                error: threatStudentError
+            } = await supabase
+                .from('users')
+                .select('name')
+                .eq('id', student_id)
+                .maybeSingle();
+
+            if (threatStudentError) {
+                console.error('Threat student fetch error:', threatStudentError);
             }
 
             io.emit('threat-alert', {
+                sessionId: currentSessionId,
                 studentId: student_id,
-                reason: 'Multiple scans from 1 device',
-                timestamp: new Date()
+                studentName: threatStudent?.name || 'Student',
+                reason: threatReason,
+                timestamp: new Date().toISOString()
             });
 
             return res.json({
@@ -518,6 +599,13 @@ app.post('/api/scan', async (req, res) => {
 
         if (attendanceError) {
             console.error('Attendance insert error:', attendanceError);
+
+            if (attendanceError.code === '23505') {
+                return res.json({
+                    success: false,
+                    message: 'Already marked present.'
+                });
+            }
 
             return res.status(500).json({
                 success: false,
@@ -607,10 +695,11 @@ app.post('/api/scan', async (req, res) => {
 
         // Emit to all connected clients
         io.emit('student-marked', {
+            sessionId: currentSessionId,
             studentName,
             studentId: student_id,
             pointsDelta,
-            timestamp: new Date()
+            timestamp: new Date().toISOString()
         });
 
         return res.json({
@@ -627,6 +716,132 @@ app.post('/api/scan', async (req, res) => {
     } catch (error) {
         console.error('Scan exception:', error);
 
+        return res.status(500).json({
+            success: false,
+            message: 'Server error'
+        });
+    }
+});
+
+
+// GET /api/session/live
+// Returns the current session plus the persisted attendance/threats so the
+// teacher dashboard can recover missed Socket.IO events after reconnects.
+app.get('/api/session/live', async (req, res) => {
+    try {
+        const requestedSessionId = req.query.sessionId
+            ? String(req.query.sessionId)
+            : null;
+
+        if (!currentSessionId) {
+            return res.json({
+                success: true,
+                active: false,
+                sessionId: null,
+                attendance: [],
+                threats: []
+            });
+        }
+
+        if (
+            requestedSessionId &&
+            String(currentSessionId) !== requestedSessionId
+        ) {
+            return res.json({
+                success: true,
+                active: true,
+                sessionId: currentSessionId,
+                attendance: [],
+                threats: []
+            });
+        }
+
+        const { data: sessionData, error: sessionError } = await supabase
+            .from('sessions')
+            .select('id, teacher_id, subject, class_id, start_time, status')
+            .eq('id', currentSessionId)
+            .maybeSingle();
+
+        if (sessionError) {
+            console.error('Live session query error:', sessionError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load session'
+            });
+        }
+
+        const { data: attendanceRows, error: attendanceError } = await supabase
+            .from('attendance')
+            .select('id, student_id, session_id, is_late, points_delta, timestamp')
+            .eq('session_id', currentSessionId)
+            .order('timestamp', { ascending: false });
+
+        if (attendanceError) {
+            console.error('Live attendance query error:', attendanceError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load attendance'
+            });
+        }
+
+        const { data: threatRows, error: threatError } = await supabase
+            .from('threats')
+            .select('*')
+            .eq('session_id', currentSessionId)
+            .order('timestamp', { ascending: false });
+
+        if (threatError) {
+            console.error('Live threats query error:', threatError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load threats'
+            });
+        }
+
+        const studentIds = [
+            ...new Set(
+                (attendanceRows || [])
+                    .map(row => row.student_id)
+                    .filter(Boolean)
+                    .map(String)
+            )
+        ];
+
+        const { data: students, error: studentsError } =
+            studentIds.length > 0
+                ? await supabase
+                    .from('users')
+                    .select('id, name')
+                    .in('id', studentIds)
+                : { data: [], error: null };
+
+        if (studentsError) {
+            console.error('Live student-name query error:', studentsError);
+        }
+
+        const studentMap = new Map(
+            (students || []).map(student => [
+                String(student.id),
+                student.name || 'Student'
+            ])
+        );
+
+        return res.json({
+            success: true,
+            active: true,
+            sessionId: currentSessionId,
+            session: sessionData || {
+                id: currentSessionId,
+                status: 'active'
+            },
+            attendance: (attendanceRows || []).map(row => ({
+                ...row,
+                studentName: studentMap.get(String(row.student_id)) || 'Student'
+            })),
+            threats: threatRows || []
+        });
+    } catch (error) {
+        console.error('Live session exception:', error);
         return res.status(500).json({
             success: false,
             message: 'Server error'
@@ -702,6 +917,370 @@ app.get('/api/my-score', async (req, res) => {
 });
 
 
+// ============================================================
+// REPORTS
+// ============================================================
+
+// GET /api/reports/attendance
+// Teacher-wide attendance matrix across all sessions conducted by the teacher.
+app.get('/api/reports/attendance', async (req, res) => {
+    try {
+        const { teacherId } = req.query;
+
+        if (!teacherId) {
+            return res.status(400).json({
+                success: false,
+                message: 'teacherId is required'
+            });
+        }
+
+        const { data: sessions, error: sessionError } = await supabase
+            .from('sessions')
+            .select('id, subject, class_id, start_time, end_time, status')
+            .eq('teacher_id', teacherId)
+            .order('start_time', { ascending: false });
+
+        if (sessionError) {
+            console.error('Attendance report session error:', sessionError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load report sessions'
+            });
+        }
+
+        const { data: students, error: studentError } = await supabase
+            .from('users')
+            .select('id, name, email')
+            .eq('role', 'student')
+            .order('name', { ascending: true });
+
+        if (studentError) {
+            console.error('Attendance report student error:', studentError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load students'
+            });
+        }
+
+        if (!sessions || sessions.length === 0 || !students || students.length === 0) {
+            return res.json({
+                success: true,
+                report: []
+            });
+        }
+
+        const sessionIds = sessions.map(session => session.id);
+
+        const { data: attendanceRows, error: attendanceError } = await supabase
+            .from('attendance')
+            .select('id, student_id, session_id, is_late, points_delta, method, timestamp')
+            .in('session_id', sessionIds);
+
+        if (attendanceError) {
+            console.error('Attendance report attendance error:', attendanceError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load attendance records'
+            });
+        }
+
+        const attendanceMap = new Map();
+
+        (attendanceRows || []).forEach(row => {
+            attendanceMap.set(
+                `${String(row.session_id)}::${String(row.student_id)}`,
+                row
+            );
+        });
+
+        const report = [];
+
+        sessions.forEach(session => {
+            students.forEach(student => {
+                const record = attendanceMap.get(
+                    `${String(session.id)}::${String(student.id)}`
+                );
+
+                report.push({
+                    student_id: student.id,
+                    student_name: student.name || 'Unknown',
+                    student_email: student.email || '',
+                    subject: session.subject || '',
+                    class_section: session.class_id || '',
+                    session_date: session.start_time || '',
+                    attendance_status: record
+                        ? (record.is_late ? 'Late' : 'Present')
+                        : 'Absent',
+                    points_delta: record ? (record.points_delta ?? 0) : 0,
+                    method: record?.method || 'Not Marked',
+                    marked_at: record?.timestamp || ''
+                });
+            });
+        });
+
+        return res.json({
+            success: true,
+            report
+        });
+    } catch (error) {
+        console.error('Attendance report exception:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Server error'
+        });
+    }
+});
+
+
+// GET /api/reports/student
+// Full attendance history for one student across the teacher's sessions.
+app.get('/api/reports/student', async (req, res) => {
+    try {
+        const { teacherId, studentId } = req.query;
+
+        if (!teacherId || !studentId) {
+            return res.status(400).json({
+                success: false,
+                message: 'teacherId and studentId are required'
+            });
+        }
+
+        const { data: student, error: studentError } = await supabase
+            .from('users')
+            .select('id, name, email')
+            .eq('id', studentId)
+            .eq('role', 'student')
+            .maybeSingle();
+
+        if (studentError) {
+            console.error('Student report user error:', studentError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load student'
+            });
+        }
+
+        if (!student) {
+            return res.status(404).json({
+                success: false,
+                message: 'Student not found'
+            });
+        }
+
+        const { data: sessions, error: sessionError } = await supabase
+            .from('sessions')
+            .select('id, subject, class_id, start_time, end_time, status')
+            .eq('teacher_id', teacherId)
+            .order('start_time', { ascending: false });
+
+        if (sessionError) {
+            console.error('Student report session error:', sessionError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load sessions'
+            });
+        }
+
+        if (!sessions || sessions.length === 0) {
+            return res.json({
+                success: true,
+                report: []
+            });
+        }
+
+        const sessionIds = sessions.map(session => session.id);
+
+        const { data: attendanceRows, error: attendanceError } = await supabase
+            .from('attendance')
+            .select('id, student_id, session_id, is_late, points_delta, method, timestamp')
+            .eq('student_id', studentId)
+            .in('session_id', sessionIds);
+
+        if (attendanceError) {
+            console.error('Student report attendance error:', attendanceError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load student attendance'
+            });
+        }
+
+        const attendanceMap = new Map(
+            (attendanceRows || []).map(row => [String(row.session_id), row])
+        );
+
+        const report = sessions.map(session => {
+            const record = attendanceMap.get(String(session.id));
+
+            return {
+                student_id: student.id,
+                student_name: student.name || 'Unknown',
+                student_email: student.email || '',
+                subject: session.subject || '',
+                class_section: session.class_id || '',
+                session_date: session.start_time || '',
+                attendance_status: record
+                    ? (record.is_late ? 'Late' : 'Present')
+                    : 'Absent',
+                points_delta: record ? (record.points_delta ?? 0) : 0,
+                method: record?.method || 'Not Marked',
+                marked_at: record?.timestamp || ''
+            };
+        });
+
+        return res.json({
+            success: true,
+            report
+        });
+    } catch (error) {
+        console.error('Student report exception:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Server error'
+        });
+    }
+});
+
+
+// GET /api/reports/student-behaviour
+// Compact analytics summary for a student: attendance, late scans,
+// absences, points and recorded security threats.
+app.get('/api/reports/student-behaviour', async (req, res) => {
+    try {
+        const { teacherId, studentId } = req.query;
+
+        if (!teacherId || !studentId) {
+            return res.status(400).json({
+                success: false,
+                message: 'teacherId and studentId are required'
+            });
+        }
+
+        const { data: student, error: studentError } = await supabase
+            .from('users')
+            .select('id, name, email')
+            .eq('id', studentId)
+            .eq('role', 'student')
+            .maybeSingle();
+
+        if (studentError) {
+            console.error('Behaviour report user error:', studentError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load student'
+            });
+        }
+
+        if (!student) {
+            return res.status(404).json({
+                success: false,
+                message: 'Student not found'
+            });
+        }
+
+        const { data: sessions, error: sessionError } = await supabase
+            .from('sessions')
+            .select('id, subject, class_id, start_time')
+            .eq('teacher_id', teacherId)
+            .order('start_time', { ascending: false });
+
+        if (sessionError) {
+            console.error('Behaviour report session error:', sessionError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load sessions'
+            });
+        }
+
+        const sessionIds = (sessions || []).map(session => session.id);
+
+        const { data: attendanceRows, error: attendanceError } = sessionIds.length > 0
+            ? await supabase
+                .from('attendance')
+                .select('id, session_id, is_late, points_delta, timestamp')
+                .eq('student_id', studentId)
+                .in('session_id', sessionIds)
+            : { data: [], error: null };
+
+        if (attendanceError) {
+            console.error('Behaviour report attendance error:', attendanceError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load attendance history'
+            });
+        }
+
+        const { data: threatRows, error: threatError } = sessionIds.length > 0
+            ? await supabase
+                .from('threats')
+                .select('id, session_id, reason, timestamp')
+                .eq('student_id', studentId)
+                .in('session_id', sessionIds)
+                .order('timestamp', { ascending: false })
+            : { data: [], error: null };
+
+        if (threatError) {
+            console.error('Behaviour report threat error:', threatError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load threat history'
+            });
+        }
+
+        const { data: scoreData, error: scoreError } = await supabase
+            .from('scores')
+            .select('score')
+            .eq('student_id', studentId)
+            .maybeSingle();
+
+        if (scoreError) {
+            console.error('Behaviour report score error:', scoreError);
+        }
+
+        const totalSessions = sessions?.length || 0;
+        const attendedSessions = (attendanceRows || []).length;
+        const lateSessions = (attendanceRows || [])
+            .filter(row => row.is_late).length;
+        const absentSessions = Math.max(
+            0,
+            totalSessions - attendedSessions
+        );
+        const pointsDelta = (attendanceRows || [])
+            .reduce(
+                (sum, row) => sum + Number(row.points_delta || 0),
+                0
+            );
+        const attendanceRate = totalSessions > 0
+            ? Number(((attendedSessions / totalSessions) * 100).toFixed(2))
+            : 0;
+
+        const report = [{
+            student_id: student.id,
+            student_name: student.name || 'Unknown',
+            student_email: student.email || '',
+            total_sessions: totalSessions,
+            attended_sessions: attendedSessions,
+            late_sessions: lateSessions,
+            absent_sessions: absentSessions,
+            attendance_rate_percent: attendanceRate,
+            security_threats: (threatRows || []).length,
+            current_credibility_score: scoreData?.score ?? 100,
+            net_points_delta: pointsDelta
+        }];
+
+        return res.json({
+            success: true,
+            report
+        });
+    } catch (error) {
+        console.error('Student behaviour report exception:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Server error'
+        });
+    }
+});
+
+
 // GET /api/threats
 app.get('/api/threats', async (req, res) => {
     try {
@@ -744,10 +1323,19 @@ app.get('/api/threats', async (req, res) => {
 
 // ─── SOCKET.IO ───────────────────────────────
 io.on('connection', (socket) => {
-    console.log('Client connected');
+    console.log(
+        `[${new Date().toISOString()}] Socket connected: ${socket.id}`
+    );
 
-    socket.on('disconnect', () => {
-        console.log('Client disconnected');
+    socket.emit('server-state', {
+        active: Boolean(currentSessionId),
+        sessionId: currentSessionId
+    });
+
+    socket.on('disconnect', (reason) => {
+        console.log(
+            `[${new Date().toISOString()}] Socket disconnected: ${socket.id} (${reason})`
+        );
     });
 });
 
@@ -757,4 +1345,13 @@ const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`AttendX backend running on port ${PORT}`);
+    console.log('LAN access: use http://<THIS-LAPTOP-IP>:' + PORT);
+    console.log(
+        'Classroom config:',
+        {
+            lat: process.env.CLASSROOM_LAT,
+            lng: process.env.CLASSROOM_LNG,
+            radius: process.env.CLASSROOM_RADIUS
+        }
+    );
 });
